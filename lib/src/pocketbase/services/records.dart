@@ -334,31 +334,7 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
   }) {
     final policy = resolvePolicy(requestPolicy);
     UnsubscribeFunc? unsub;
-    final controller = StreamController<RecordModel?>(
-      onListen: () async {
-        if (policy.isNetwork) {
-          try {
-            unsub = await subscribe(id, (e) {});
-          } catch (e) {
-            client.logger
-                .warning('Error subscribing to record $service/$id', e);
-          }
-        }
-        await getOneOrNull(id,
-            expand: expand, fields: fields, requestPolicy: policy);
-      },
-      onCancel: () async {
-        if (policy.isNetwork) {
-          try {
-            await unsub?.call();
-          } catch (e) {
-            client.logger.fine(
-                'Error unsubscribing from record $service/$id (may be intentional)',
-                e);
-          }
-        }
-      },
-    );
+    StreamSubscription<RecordModel?>? dbSubscription;
     var stream = client.db
         .$query(
           service,
@@ -377,7 +353,56 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
       });
     }
 
-    controller.addStream(stream);
+    late final StreamController<RecordModel?> controller;
+    controller = StreamController<RecordModel?>(
+      onListen: () async {
+        // Forwarded manually (rather than controller.addStream(stream))
+        // because addStream claims exclusive ownership of adding events to
+        // the controller for as long as it runs -- a live db watch never
+        // completes, so a later controller.addError call below (from a
+        // separate async callback) would hit "Bad state: Cannot add event
+        // while adding a stream" if addStream were used instead.
+        dbSubscription = stream.listen(
+          (data) {
+            if (!controller.isClosed) controller.add(data);
+          },
+          onError: (Object e, StackTrace st) {
+            if (!controller.isClosed) controller.addError(e, st);
+          },
+        );
+        if (policy.isNetwork) {
+          try {
+            unsub = await subscribe(id, (e) {});
+          } catch (e) {
+            client.logger
+                .warning('Error subscribing to record $service/$id', e);
+          }
+        }
+        try {
+          await getOneOrNull(id,
+              expand: expand, fields: fields, requestPolicy: policy);
+        } catch (e, st) {
+          // Without this, a failed initial fetch (network down and no
+          // usable cache under an isNetwork policy) throws inside this
+          // unawaited onListen callback and is silently lost -- it never
+          // reaches the stream this method returns, so callers can never
+          // observe or react to it.
+          if (!controller.isClosed) controller.addError(e, st);
+        }
+      },
+      onCancel: () async {
+        await dbSubscription?.cancel();
+        if (policy.isNetwork) {
+          try {
+            await unsub?.call();
+          } catch (e) {
+            client.logger.fine(
+                'Error unsubscribing from record $service/$id (may be intentional)',
+                e);
+          }
+        }
+      },
+    );
     return controller.stream;
   }
 
@@ -392,38 +417,7 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
   }) {
     final policy = resolvePolicy(requestPolicy);
     UnsubscribeFunc? unsub;
-    final controller = StreamController<List<RecordModel>>(
-      onListen: () async {
-        if (policy.isNetwork) {
-          try {
-            unsub = await subscribe('*', (e) {});
-          } catch (e) {
-            client.logger
-                .warning('Error subscribing to collection $service', e);
-          }
-        }
-        final items = await getFullList(
-          requestPolicy: policy,
-          filter: filter,
-          expand: expand,
-          sort: sort,
-          fields: fields,
-        );
-        client.logger.fine(
-            'Realtime initial full list for "$service" [${policy.name}]: ${items.length} items');
-      },
-      onCancel: () async {
-        if (policy.isNetwork) {
-          try {
-            await unsub?.call();
-          } catch (e) {
-            client.logger.fine(
-                'Error unsubscribing from collection $service (may be intentional)',
-                e);
-          }
-        }
-      },
-    );
+    StreamSubscription<List<RecordModel>>? dbSubscription;
     var stream = client.db
         .$query(
           service,
@@ -449,7 +443,63 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
       });
     }
 
-    controller.addStream(stream);
+    late final StreamController<List<RecordModel>> controller;
+    controller = StreamController<List<RecordModel>>(
+      onListen: () async {
+        // Forwarded manually (rather than controller.addStream(stream))
+        // because addStream claims exclusive ownership of adding events to
+        // the controller for as long as it runs -- a live db watch never
+        // completes, so a later controller.addError call below (from a
+        // separate async callback) would hit "Bad state: Cannot add event
+        // while adding a stream" if addStream were used instead.
+        dbSubscription = stream.listen(
+          (data) {
+            if (!controller.isClosed) controller.add(data);
+          },
+          onError: (Object e, StackTrace st) {
+            if (!controller.isClosed) controller.addError(e, st);
+          },
+        );
+        if (policy.isNetwork) {
+          try {
+            unsub = await subscribe('*', (e) {});
+          } catch (e) {
+            client.logger
+                .warning('Error subscribing to collection $service', e);
+          }
+        }
+        try {
+          final items = await getFullList(
+            requestPolicy: policy,
+            filter: filter,
+            expand: expand,
+            sort: sort,
+            fields: fields,
+          );
+          client.logger.fine(
+              'Realtime initial full list for "$service" [${policy.name}]: ${items.length} items');
+        } catch (e, st) {
+          // Without this, a failed initial fetch (network down and no
+          // usable cache under an isNetwork policy) throws inside this
+          // unawaited onListen callback and is silently lost -- it never
+          // reaches the stream this method returns, so callers can never
+          // observe or react to it.
+          if (!controller.isClosed) controller.addError(e, st);
+        }
+      },
+      onCancel: () async {
+        await dbSubscription?.cancel();
+        if (policy.isNetwork) {
+          try {
+            await unsub?.call();
+          } catch (e) {
+            client.logger.fine(
+                'Error unsubscribing from collection $service (may be intentional)',
+                e);
+          }
+        }
+      },
+    );
     return controller.stream;
   }
 
@@ -501,6 +551,13 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
         try {
           await getOneOrNull(id,
               expand: expand, fields: fields, requestPolicy: policy);
+        } catch (e, st) {
+          // Without this, a failed initial fetch (network down and no
+          // usable cache under an isNetwork policy) throws inside this
+          // unawaited onListen callback and is silently lost -- it never
+          // reaches the stream this method returns, so callers can never
+          // observe or react to it.
+          if (!controller.isClosed) controller.addError(e, st);
         } finally {
           if (isFetchingNetwork) {
             isFetchingNetwork = false;
@@ -601,6 +658,13 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
           );
           client.logger.fine(
               'Realtime initial full list for "$service" [${policy.name}]: ${items.length} items');
+        } catch (e, st) {
+          // Without this, a failed initial fetch (network down and no
+          // usable cache under an isNetwork policy) throws inside this
+          // unawaited onListen callback and is silently lost -- it never
+          // reaches the stream this method returns, so callers can never
+          // observe or react to it.
+          if (!controller.isClosed) controller.addError(e, st);
         } finally {
           if (isFetchingNetwork) {
             isFetchingNetwork = false;
