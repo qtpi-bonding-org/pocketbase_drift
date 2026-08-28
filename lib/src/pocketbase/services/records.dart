@@ -5,6 +5,15 @@ import 'package:http/http.dart' as http;
 
 import 'package:pocketbase_drift/pocketbase_drift.dart';
 
+/// The data half of `watchRecordState`/`watchRecordsState`'s output. Failures
+/// are NOT modeled here -- they arrive as a separate stream error via
+/// `controller.addError`, immediately followed by one more `QueryState` data
+/// event (`isFetchingNetwork: false`, carrying whatever cached data exists).
+/// A `StreamBuilder` that only inspects `AsyncSnapshot.hasError`/`.data` will
+/// see the error for a single frame before that follow-up data event
+/// overwrites it -- consume the stream's `onError` directly (e.g. via
+/// `.listen(onError: ...)`) if the failure itself must be observed, rather
+/// than relying on the snapshot.
 class QueryState<T> {
   const QueryState({
     required this.data,
@@ -335,6 +344,7 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
     final policy = resolvePolicy(requestPolicy);
     UnsubscribeFunc? unsub;
     StreamSubscription<RecordModel?>? dbSubscription;
+    var cancelled = false;
     var stream = client.db
         .$query(
           service,
@@ -372,7 +382,14 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
         );
         if (policy.isNetwork) {
           try {
-            unsub = await subscribe(id, (e) {});
+            final result = await subscribe(id, (e) {});
+            if (cancelled) {
+              // onCancel already ran and saw unsub == null, so it could not
+              // tear this down -- do it here instead of leaking it forever.
+              await result.call();
+            } else {
+              unsub = result;
+            }
           } catch (e) {
             client.logger
                 .warning('Error subscribing to record $service/$id', e);
@@ -393,6 +410,7 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
       onPause: () => dbSubscription?.pause(),
       onResume: () => dbSubscription?.resume(),
       onCancel: () async {
+        cancelled = true;
         try {
           await dbSubscription?.cancel();
         } finally {
@@ -423,6 +441,7 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
     final policy = resolvePolicy(requestPolicy);
     UnsubscribeFunc? unsub;
     StreamSubscription<List<RecordModel>>? dbSubscription;
+    var cancelled = false;
     var stream = client.db
         .$query(
           service,
@@ -467,7 +486,14 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
         );
         if (policy.isNetwork) {
           try {
-            unsub = await subscribe('*', (e) {});
+            final result = await subscribe('*', (e) {});
+            if (cancelled) {
+              // onCancel already ran and saw unsub == null, so it could not
+              // tear this down -- do it here instead of leaking it forever.
+              await result.call();
+            } else {
+              unsub = result;
+            }
           } catch (e) {
             client.logger
                 .warning('Error subscribing to collection $service', e);
@@ -495,6 +521,7 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
       onPause: () => dbSubscription?.pause(),
       onResume: () => dbSubscription?.resume(),
       onCancel: () async {
+        cancelled = true;
         try {
           await dbSubscription?.cancel();
         } finally {
@@ -525,29 +552,29 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
     bool isFetchingNetwork = policy.isNetwork;
     StreamSubscription<RecordModel?>? dbSubscription;
     RecordModel? latestData;
+    var cancelled = false;
+
+    final stream = client.db
+        .$query(
+          service,
+          filter: "id = '$id'",
+          expand: expand,
+          fields: fields,
+        )
+        .map(itemFactoryFunc)
+        .watchSingleOrNull();
 
     late final StreamController<QueryState<RecordModel?>> controller;
     controller = StreamController<QueryState<RecordModel?>>(
       onListen: () async {
-        if (policy.isNetwork) {
-          try {
-            unsub = await subscribe(id, (e) {});
-          } catch (e) {
-            client.logger
-                .warning('Error subscribing to record $service/$id', e);
-          }
-        }
-
-        final stream = client.db
-            .$query(
-              service,
-              filter: "id = '$id'",
-              expand: expand,
-              fields: fields,
-            )
-            .map(itemFactoryFunc)
-            .watchSingleOrNull();
-
+        // Listening to the db stream synchronously, before any await,
+        // guarantees dbSubscription is assigned before onCancel can
+        // possibly run -- otherwise a cancel landing while `subscribe`
+        // below is in flight would see dbSubscription == null and be
+        // unable to tear down the db watch this callback creates a moment
+        // later, leaking it permanently (it keeps calling controller.add,
+        // which is a silent no-op once cancelled, so the leak was
+        // invisible rather than crashing).
         dbSubscription = stream.listen((data) {
           latestData = data;
           if (!controller.isClosed) {
@@ -557,6 +584,23 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
             ));
           }
         });
+
+        if (policy.isNetwork) {
+          try {
+            final result = await subscribe(id, (e) {});
+            if (cancelled) {
+              // onCancel already ran and saw unsub == null, so it could
+              // not tear this down -- do it here instead of leaking it
+              // forever.
+              await result.call();
+            } else {
+              unsub = result;
+            }
+          } catch (e) {
+            client.logger
+                .warning('Error subscribing to record $service/$id', e);
+          }
+        }
 
         try {
           await getOneOrNull(id,
@@ -580,15 +624,21 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
           }
         }
       },
+      onPause: () => dbSubscription?.pause(),
+      onResume: () => dbSubscription?.resume(),
       onCancel: () async {
-        await dbSubscription?.cancel();
-        if (policy.isNetwork) {
-          try {
-            await unsub?.call();
-          } catch (e) {
-            client.logger.fine(
-                'Error unsubscribing from record $service/$id (may be intentional)',
-                e);
+        cancelled = true;
+        try {
+          await dbSubscription?.cancel();
+        } finally {
+          if (policy.isNetwork) {
+            try {
+              await unsub?.call();
+            } catch (e) {
+              client.logger.fine(
+                  'Error unsubscribing from record $service/$id (may be intentional)',
+                  e);
+            }
           }
         }
       },
@@ -623,31 +673,31 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
     bool isFetchingNetwork = policy.isNetwork;
     StreamSubscription<List<RecordModel>>? dbSubscription;
     List<RecordModel> latestData = [];
+    var cancelled = false;
+
+    final stream = client.db
+        .$query(
+          service,
+          filter: filter,
+          expand: expand,
+          sort: sort,
+          limit: limit,
+          fields: fields,
+        )
+        .map(itemFactoryFunc)
+        .watch();
 
     late final StreamController<QueryState<List<RecordModel>>> controller;
     controller = StreamController<QueryState<List<RecordModel>>>(
       onListen: () async {
-        if (policy.isNetwork) {
-          try {
-            unsub = await subscribe('*', (e) {});
-          } catch (e) {
-            client.logger
-                .warning('Error subscribing to collection $service', e);
-          }
-        }
-
-        final stream = client.db
-            .$query(
-              service,
-              filter: filter,
-              expand: expand,
-              sort: sort,
-              limit: limit,
-              fields: fields,
-            )
-            .map(itemFactoryFunc)
-            .watch();
-
+        // Listening to the db stream synchronously, before any await,
+        // guarantees dbSubscription is assigned before onCancel can
+        // possibly run -- otherwise a cancel landing while `subscribe`
+        // below is in flight would see dbSubscription == null and be
+        // unable to tear down the db watch this callback creates a moment
+        // later, leaking it permanently (it keeps calling controller.add,
+        // which is a silent no-op once cancelled, so the leak was
+        // invisible rather than crashing).
         dbSubscription = stream.listen((data) {
           latestData = data;
           if (!controller.isClosed) {
@@ -657,6 +707,23 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
             ));
           }
         });
+
+        if (policy.isNetwork) {
+          try {
+            final result = await subscribe('*', (e) {});
+            if (cancelled) {
+              // onCancel already ran and saw unsub == null, so it could
+              // not tear this down -- do it here instead of leaking it
+              // forever.
+              await result.call();
+            } else {
+              unsub = result;
+            }
+          } catch (e) {
+            client.logger
+                .warning('Error subscribing to collection $service', e);
+          }
+        }
 
         try {
           final items = await getFullList(
@@ -687,15 +754,21 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
           }
         }
       },
+      onPause: () => dbSubscription?.pause(),
+      onResume: () => dbSubscription?.resume(),
       onCancel: () async {
-        await dbSubscription?.cancel();
-        if (policy.isNetwork) {
-          try {
-            await unsub?.call();
-          } catch (e) {
-            client.logger.fine(
-                'Error unsubscribing from collection $service (may be intentional)',
-                e);
+        cancelled = true;
+        try {
+          await dbSubscription?.cancel();
+        } finally {
+          if (policy.isNetwork) {
+            try {
+              await unsub?.call();
+            } catch (e) {
+              client.logger.fine(
+                  'Error unsubscribing from collection $service (may be intentional)',
+                  e);
+            }
           }
         }
       },
