@@ -83,7 +83,7 @@ void main() {
   });
 
   test(
-      'watchRecordState surfaces a networkOnly fetch failure as a stream '
+      'watchRecordsState surfaces a networkOnly fetch failure as a stream '
       'error instead of silently vanishing', () async {
     final service = await client.$collection('todo');
 
@@ -98,5 +98,43 @@ void main() {
     expect(errors, isNotEmpty,
         reason: 'the networkOnly fetch failure inside onListen must reach '
             'this stream as a catchable error, not vanish silently');
+  });
+
+  // watchRecord/watchRecordState (singular) fetch via getOneOrNull, which
+  // already swallows every failure internally and returns null rather than
+  // rethrowing -- so their added onListen catch block can never actually
+  // fire from a fetch failure today, and isn't testable the same way as the
+  // plural methods above. What genuinely needed coverage for the singular
+  // methods is the addStream -> manual .listen()/controller.add() refactor
+  // itself (watchRecord only -- watchRecordState already forwarded
+  // manually and was never touched structurally): confirm it still streams
+  // live updates correctly instead of silently breaking liveness.
+  test('watchRecord still streams live updates after the addStream -> '
+      'manual-forwarding refactor', () async {
+    final service = await client.$collection('todo');
+    await client.db.deleteAll(service.service);
+
+    final created = await service.create(
+      body: {'name': 'watch_record_initial'},
+      requestPolicy: RequestPolicy.cacheAndNetwork,
+    );
+
+    final events = <RecordModel?>[];
+    final subscription =
+        service.watchRecord(created.id).listen(events.add);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+
+    await service.update(
+      created.id,
+      body: {'name': 'watch_record_updated'},
+      requestPolicy: RequestPolicy.cacheAndNetwork,
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    await subscription.cancel();
+
+    expect(events, isNotEmpty);
+    expect(events.last?.data['name'], 'watch_record_updated',
+        reason: 'watchRecord must still emit live updates through the '
+            'manually-forwarded db stream, not just the initial snapshot');
   });
 }

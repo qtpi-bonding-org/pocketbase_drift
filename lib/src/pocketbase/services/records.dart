@@ -390,15 +390,20 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
           if (!controller.isClosed) controller.addError(e, st);
         }
       },
+      onPause: () => dbSubscription?.pause(),
+      onResume: () => dbSubscription?.resume(),
       onCancel: () async {
-        await dbSubscription?.cancel();
-        if (policy.isNetwork) {
-          try {
-            await unsub?.call();
-          } catch (e) {
-            client.logger.fine(
-                'Error unsubscribing from record $service/$id (may be intentional)',
-                e);
+        try {
+          await dbSubscription?.cancel();
+        } finally {
+          if (policy.isNetwork) {
+            try {
+              await unsub?.call();
+            } catch (e) {
+              client.logger.fine(
+                  'Error unsubscribing from record $service/$id (may be intentional)',
+                  e);
+            }
           }
         }
       },
@@ -487,15 +492,20 @@ class $RecordService extends RecordService with ServiceMixin<RecordModel> {
           if (!controller.isClosed) controller.addError(e, st);
         }
       },
+      onPause: () => dbSubscription?.pause(),
+      onResume: () => dbSubscription?.resume(),
       onCancel: () async {
-        await dbSubscription?.cancel();
-        if (policy.isNetwork) {
-          try {
-            await unsub?.call();
-          } catch (e) {
-            client.logger.fine(
-                'Error unsubscribing from collection $service (may be intentional)',
-                e);
+        try {
+          await dbSubscription?.cancel();
+        } finally {
+          if (policy.isNetwork) {
+            try {
+              await unsub?.call();
+            } catch (e) {
+              client.logger.fine(
+                  'Error unsubscribing from collection $service (may be intentional)',
+                  e);
+            }
           }
         }
       },
